@@ -1,7 +1,7 @@
 import express from 'express';
 import { spawn } from 'child_process';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { z } from 'zod';
 import jwt from 'jsonwebtoken';
 import jwksClient from 'jwks-rsa';
@@ -48,77 +48,51 @@ app.use(authMiddleware);
 
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'gws-mcp-server-node' }));
 
-const transports = new Map();
-const servers = new Map();
-
-function createMcpServer() {
-  const server = new McpServer({
-    name: "GWS Remote MCP Server",
-    version: "1.0.0"
-  });
-
-  server.tool("execute_gws", {
-    service: z.string().describe("The GWS service to use (e.g., 'gmail')"),
-    command: z.string().describe("The subcommand to execute (e.g., 'messages list')"),
-    params: z.record(z.any()).optional().describe("Optional JSON parameters (--params flag)"),
-    args: z.array(z.string()).optional().describe("Optional list of additional args")
-  }, async ({ service, command, params, args }) => {
-    return new Promise((resolve) => {
-      const cmdArgs = [service, ...command.split(' ')];
-      if (params) cmdArgs.push('--params', JSON.stringify(params));
-      if (args) cmdArgs.push(...args);
-
-      const proc = spawn('gws', cmdArgs);
-      let stdout = '';
-      let stderr = '';
-
-      proc.stdout.on('data', (data) => { stdout += data.toString(); });
-      proc.stderr.on('data', (data) => { stderr += data.toString(); });
-
-      proc.on('close', (code) => {
-        if (code !== 0) {
-          resolve({
-            content: [{ type: "text", text: `Error (Exit Code ${code}):\n${stderr}` }]
-          });
-        } else {
-          resolve({
-            content: [{ type: "text", text: stdout }]
-          });
-        }
-      });
-    });
-  });
-  return server;
-}
-
-app.get("/mcp/sse", async (req, res) => {
-  const sessionId = crypto.randomUUID();
-  const transport = new SSEServerTransport(`/mcp/messages?sessionId=${sessionId}`, res);
-  const server = createMcpServer();
-
-  transports.set(sessionId, transport);
-  servers.set(sessionId, server);
-
-  res.on('close', () => {
-    transports.delete(sessionId);
-    servers.delete(sessionId);
-  });
-
-  try {
-      await server.connect(transport);
-  } catch(e) {
-      console.error(e);
-  }
+const server = new McpServer({
+  name: "GWS Remote MCP Server",
+  version: "1.0.0"
 });
 
-app.post("/mcp/messages", async (req, res) => {
-  const sessionId = req.query.sessionId;
-  const transport = transports.get(sessionId);
+server.tool("execute_gws", {
+  service: z.string().describe("The GWS service to use (e.g., 'gmail')"),
+  command: z.string().describe("The subcommand to execute (e.g., 'messages list')"),
+  params: z.record(z.any()).optional().describe("Optional JSON parameters (--params flag)"),
+  args: z.array(z.string()).optional().describe("Optional list of additional args")
+}, async ({ service, command, params, args }) => {
+  return new Promise((resolve) => {
+    const cmdArgs = [service, ...command.split(' ')];
+    if (params) cmdArgs.push('--params', JSON.stringify(params));
+    if (args) cmdArgs.push(...args);
 
-  if (transport) {
-    await transport.handlePostMessage(req, res);
-  } else {
-    res.status(400).send("No active transport");
+    const proc = spawn('gws', cmdArgs);
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        resolve({
+          content: [{ type: "text", text: `Error (Exit Code ${code}):\n${stderr}` }]
+        });
+      } else {
+        resolve({
+          content: [{ type: "text", text: stdout }]
+        });
+      }
+    });
+  });
+});
+
+const transport = new StreamableHTTPServerTransport();
+
+// Create a unified endpoint for Streamable HTTP
+app.all("/mcp", async (req, res) => {
+  try {
+    await transport.handleRequest(req, res, server);
+  } catch(e) {
+      console.error(e);
   }
 });
 

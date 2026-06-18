@@ -1,20 +1,23 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 import jwt
 from jwt import PyJWKClient
 
+# Import our FastMCP server instance
 from server import mcp
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gws-mcp-server")
 
+# OAuth 2.1 Configuration
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://your-idp.example.com/")
-OAUTH_AUDIENCE = os.getenv("OAUTH_AUDIENCE", "https://mcp.example.com")
+OAUTH_AUDIENCE = os.getenv("OAUTH_AUDIENCE", "https://mcp.example.com") # Canonical Server URI
 JWKS_URI = os.getenv("JWKS_URI", f"{OAUTH_ISSUER}.well-known/jwks.json")
-ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").lower() == "true"
+ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").lower() == "true" # Disabled by default for local testing
 REQUIRED_SCOPES = os.getenv("REQUIRED_SCOPES", "gws:read gws:write").split()
 
 jwks_client = None
@@ -31,6 +34,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down GWS Remote MCP Server")
 
+# Create the FastAPI app
 app = FastAPI(
     title="GWS Remote MCP Server",
     description="An OAuth 2.1 protected MCP server wrapping the Google Workspace CLI",
@@ -50,6 +54,7 @@ class ASGIAuthMiddleware:
         if path in ["/health", "/docs", "/openapi.json"] or not ENABLE_AUTH:
             return await self.app(scope, receive, send)
 
+        # Check auth
         headers = dict(scope.get("headers", []))
         auth_header = headers.get(b"authorization", b"").decode("utf-8")
 
@@ -63,6 +68,7 @@ class ASGIAuthMiddleware:
             signing_key = client.get_signing_key_from_jwt(token)
             payload = jwt.decode(token, signing_key.key, algorithms=["RS256", "ES256"], audience=OAUTH_AUDIENCE, issuer=OAUTH_ISSUER)
 
+            # Check scopes (basic enterprise security practice)
             token_scopes = payload.get("scope", "").split()
             if REQUIRED_SCOPES and not any(scope in token_scopes for scope in REQUIRED_SCOPES):
                 await self._send_401(send, "Insufficient scope", 'Bearer error="insufficient_scope"')
@@ -93,22 +99,15 @@ class ASGIAuthMiddleware:
 
 app_with_auth = ASGIAuthMiddleware(app)
 
+# Enterprise Health Check endpoint
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "service": "gws-mcp-server"}
 
-from mcp.server.sse import SseServerTransport
-transport = SseServerTransport("/mcp/messages")
-
-@app.get("/mcp/sse")
-async def handle_sse(request: Request):
-    async with transport.connect_sse(request.scope, request.receive, request._send) as streams:
-        await mcp._mcp_server.run(streams[0], streams[1], mcp._mcp_server.create_initialization_options())
-
-@app.post("/mcp/messages")
-async def handle_messages(request: Request):
-    await transport.handle_post_message(request.scope, request.receive, request._send)
+mcp_starlette = mcp.streamable_http_app()
+app.mount("/mcp", mcp_starlette)
 
 if __name__ == "__main__":
     import uvicorn
+    # When running directly
     uvicorn.run("app:app_with_auth", host="0.0.0.0", port=8000, reload=True)

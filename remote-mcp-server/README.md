@@ -75,10 +75,9 @@ curl -I http://localhost:8000/health
 
 ### 6. Client Connection
 
-MCP Clients must connect to the following endpoints using the HTTP SSE Transport:
+MCP Clients must connect using the newer **Streamable HTTP Transport** (supported by `@modelcontextprotocol/sdk` >= 1.4).
 
-- **SSE Endpoint**: `GET /mcp/sse`
-- **Messages Endpoint**: `POST /mcp/messages?sessionId=<uuid>` (The exact URL is returned by the server upon connecting to the SSE endpoint).
+- **Streamable Endpoint**: `POST /mcp`
 
 Clients **must** include the header:
 ```

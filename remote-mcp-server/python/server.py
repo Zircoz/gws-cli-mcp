@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import subprocess
 from typing import Any, Dict, List, Optional
 from mcp.server.fastmcp import FastMCP
 
@@ -38,3 +39,15 @@ async def execute_gws(service: str, command: str, params: Optional[Dict[str, Any
 
     except Exception as e:
         return f"Failed to execute command: {str(e)}"
+
+# A simplistic attempt at dynamic tool generation based on discovery
+# This relies on `gws` CLI exposing the schema.
+def generate_tools():
+    try:
+        # For an enterprise deployment, one could fetch the Discovery docs directly
+        # and register them as tools. Here we provide a foundation.
+        pass
+    except Exception as e:
+        logging.error(f"Could not dynamically generate tools: {e}")
+
+generate_tools()
