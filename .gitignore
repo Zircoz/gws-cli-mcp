@@ -48,3 +48,8 @@ docs/plans/
 # Generated
 demo.mp4
 download.html
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
