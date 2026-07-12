@@ -6,6 +6,8 @@ import subprocess
 from typing import Any, Dict, List, Optional, Set
 from mcp.server.fastmcp import FastMCP
 
+logger = logging.getLogger(__name__)
+
 # Initialize FastMCP server
 mcp = FastMCP("GWS Remote MCP Server")
 
@@ -27,9 +29,9 @@ ALLOWED_SERVICES: Optional[Set[str]] = (
 )
 
 if ALLOWED_SERVICES is not None:
-    logging.info(f"Service allowlist active: {sorted(ALLOWED_SERVICES)}")
+    logger.info(f"Service allowlist active: {sorted(ALLOWED_SERVICES)}")
 else:
-    logging.info("Service allowlist: unrestricted (GWS_ALLOWED_SERVICES not set or '*')")
+    logger.info("Service allowlist: unrestricted (GWS_ALLOWED_SERVICES not set or '*')")
 
 
 @mcp.tool()
@@ -65,7 +67,7 @@ async def execute_gws(
         cmd.extend(args)
 
     try:
-        logging.info(f"Executing: {' '.join(cmd)}")
+        logger.info(f"Executing: {' '.join(cmd)}")
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,

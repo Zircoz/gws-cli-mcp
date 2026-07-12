@@ -9,16 +9,13 @@ It is designed for **Enterprise Deployments** and includes OAuth 2.1 authorizati
 ## Architecture
 
 1. **MCP Client** (e.g. an AI agent) obtains an OAuth 2.1 Bearer token from your Enterprise Identity Provider (IdP) (e.g., Okta, Auth0, Keycloak).
-2. The Client connects to this Remote MCP Server via `POST /mcp`, passing the `Authorization: Bearer <token>` header.
+2. The Client connects to this Remote MCP Server via `/mcp`, passing the `Authorization: Bearer <token>` header.
 3. The Server acts as a **Resource Server**, fetching the JWKS (JSON Web Key Set) from your IdP to cryptographically verify the token's signature, issuer, audience, and expiration.
 4. Once authenticated, the Client can execute tools (e.g., `execute_gws`) which securely invoke the underlying `gws` CLI.
 
-## Implementations
+## Implementation
 
-We provide two reference implementations to suit your infrastructure:
-
-- **Python (Recommended)**: Built using `FastMCP` (from the official `mcp` SDK) and `FastAPI`. Best for high-concurrency async operations.
-- **Node.js**: Built using Express and the `@modelcontextprotocol/sdk`.
+`python/` — built using `FastMCP` (from the official `mcp` SDK, `>=1.8.0` for `streamable_http_app()`) and `FastAPI`, mounted behind an ASGI OAuth 2.1 verification middleware.
 
 ## Enterprise Deployment Best Practices
 
@@ -28,15 +25,13 @@ We provide two reference implementations to suit your infrastructure:
 
 ### 1. Configuration (Environment Variables)
 
-Both the Python and Node.js servers rely on the following environment variables:
-
 | Variable | Description | Default |
 |---|---|---|
 | `ENABLE_AUTH` | Set to `true` to enable OAuth 2.1 Bearer token validation. | `false` (for local testing) |
 | `OAUTH_ISSUER` | The URL of your Authorization Server (IdP). | `https://your-idp.example.com/` |
 | `OAUTH_AUDIENCE` | The expected `aud` claim in the JWT. Usually the Canonical Server URI of this MCP server. | `https://mcp.example.com` |
 | `JWKS_URI` | The URI to fetch public keys to verify JWT signatures. | `$OAUTH_ISSUER.well-known/jwks.json` |
-| `REQUIRED_SCOPES` | Space-separated list: the JWT must contain at least one of these scopes. *(Python only)* | `gws:read gws:write` |
+| `REQUIRED_SCOPES` | Space-separated list: the JWT must contain at least one of these scopes. | `gws:read gws:write` |
 | `GWS_ALLOWED_SERVICES` | Comma-separated list of `gws` service names clients may invoke. Set to `*` or omit to allow all. | *(unrestricted)* |
 | `PORT` | The HTTP port to bind to. | `8000` |
 
@@ -64,7 +59,7 @@ Allowed services: calendar, drive, gmail
 
 ### 3. Restricting which clients can connect — marking OAuth scopes as allowed
 
-`REQUIRED_SCOPES` (Python only) controls which *callers* may reach the `execute_gws` tool at all, independent of which services they're allowed to invoke once connected. This is enforced by `ASGIAuthMiddleware` in `python/app.py`, which reads the space-delimited `scope` claim out of the verified JWT and compares it against `REQUIRED_SCOPES`:
+`REQUIRED_SCOPES` controls which *callers* may reach the `execute_gws` tool at all, independent of which services they're allowed to invoke once connected. This is enforced by `ASGIAuthMiddleware` in `python/app.py`, which reads the space-delimited `scope` claim out of the verified JWT and compares it against `REQUIRED_SCOPES`:
 
 ```python
 token_scopes = payload.get("scope", "").split()
@@ -93,16 +88,13 @@ REQUIRED_SCOPES="gws:execute"
 
    Leaving `REQUIRED_SCOPES` unset falls back to the default `gws:read gws:write`; setting it to an empty string disables the scope check entirely (any authenticated token is accepted).
 
-> [!WARNING]
-> **The Node.js server does not enforce `REQUIRED_SCOPES`.** `nodejs/server.js` verifies the JWT's signature, issuer, and audience, but never inspects the `scope` claim — any successfully authenticated token is accepted regardless of its scopes. If per-scope access control matters for your deployment, use the Python implementation or add scope enforcement to `authMiddleware` in `server.js` before relying on it in production.
-
 **Combining layers for defence-in-depth:**
 
 1. **Google OAuth scopes** on the `gws` credentials — define the maximum Google Workspace permissions at the API level (e.g., `drive.readonly` credentials block all Drive write calls regardless of what the MCP server permits).
 2. **`GWS_ALLOWED_SERVICES`** — restrict which services the MCP server will proxy.
-3. **`REQUIRED_SCOPES`** on the IdP JWT — control which agents can connect to the server at all (Python only, see above).
+3. **`REQUIRED_SCOPES`** on the IdP JWT — control which agents can connect to the server at all (see above).
 
-### 4. Running the Python Server
+### 4. Running the Server
 
 ```bash
 cd python
@@ -122,42 +114,29 @@ pip install gunicorn
 gunicorn app:app_with_auth -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000
 ```
 
-### 5. Running the Node.js Server
+### 5. Health Checks
 
-```bash
-cd nodejs
-npm install
-
-ENABLE_AUTH=true \
-OAUTH_ISSUER="https://my-okta.com/oauth2/default/" \
-GWS_ALLOWED_SERVICES=drive,gmail,calendar \
-node server.js
-```
-
-### 6. Health Checks
-
-For Kubernetes or Load Balancers (AWS ALB, etc.), both servers expose a public `/health` endpoint that bypasses OAuth verification:
+For Kubernetes or Load Balancers (AWS ALB, etc.), the server exposes a public `/health` endpoint that bypasses OAuth verification:
 
 ```bash
 curl -I http://localhost:8000/health
 # HTTP/1.1 200 OK
 ```
 
-Response bodies differ slightly between implementations: the Python server returns `{"status": "ok", "service": "gws-mcp-server"}`, the Node.js server returns `{"status": "ok", "service": "gws-mcp-server-node"}`.
+The response body is `{"status": "ok", "service": "gws-mcp-server"}`.
 
-The Python server additionally leaves FastAPI's auto-generated `/docs` (Swagger UI) and `/openapi.json` endpoints unauthenticated (see `ASGIAuthMiddleware` in `app.py`). These only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them — but disable or reverse-proxy them away in security-sensitive deployments if you don't want the API docs page publicly reachable.
+The server additionally leaves FastAPI's auto-generated `/docs` (Swagger UI) and `/openapi.json` endpoints unauthenticated (see `ASGIAuthMiddleware` in `app.py`). These only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them — but disable or reverse-proxy them away in security-sensitive deployments if you don't want the API docs page publicly reachable.
 
-### 7. Logging and Observability
+### 6. Logging and Observability
 
-- **Python**: Uses the standard `logging` module. Configure `logging.basicConfig` in `app.py` to emit JSON logs if your log aggregator (Datadog, Splunk, ELK) prefers structured logs.
-- **Node.js**: Currently uses `console.log`. For enterprise use, consider replacing it with a structured logger like `pino` or `winston`.
+- Uses the standard `logging` module. Configure `logging.basicConfig` in `app.py` to emit JSON logs if your log aggregator (Datadog, Splunk, ELK) prefers structured logs. Note that `app.py` calls `logging.basicConfig()` **before** importing `server.py` — importing first would let `server.py`'s own logging calls implicitly configure the root logger at the default `WARNING` level, silently swallowing the `INFO` logs this server relies on for auditing.
 - The `gws` CLI invocations are logged. Ensure you do not log the `--params` content if it contains PII or sensitive data.
 
-### 8. Client Connection
+### 7. Client Connection
 
-MCP Clients must connect using the **Streamable HTTP Transport** (supported by `@modelcontextprotocol/sdk` >= 1.4).
+MCP Clients must connect using the **Streamable HTTP Transport** (supported by `@modelcontextprotocol/sdk` >= 1.4, or any spec-compliant MCP client).
 
-- **Streamable Endpoint**: `/mcp` — both implementations mount the transport across all HTTP methods it needs (`POST` for requests, `GET` for the SSE stream, `DELETE` to terminate a session), so route all three to the same URL rather than `POST` alone.
+- **Streamable Endpoint**: `/mcp` — the FastMCP sub-app handles all the methods the transport needs (`POST` for requests, `GET` for the SSE stream, `DELETE` to terminate a session) at this single path.
 
 Clients **must** include the header:
 ```

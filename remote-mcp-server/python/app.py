@@ -6,12 +6,15 @@ from starlette.responses import JSONResponse
 import jwt
 from jwt import PyJWKClient
 
-# Import our FastMCP server instance
-from server import mcp
-
-# Configure logging
+# Configure logging before importing server — server.py logs at import time,
+# and logging.info() implicitly calls basicConfig() at WARNING level on
+# first use, which would silently make a later basicConfig() call here a
+# no-op if it hasn't run yet.
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gws-mcp-server")
+
+# Import our FastMCP server instance
+from server import mcp
 
 # OAuth 2.1 Configuration
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://your-idp.example.com/")
@@ -31,7 +34,13 @@ def get_jwks_client():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting GWS Remote MCP Server")
-    yield
+    # The streamable HTTP transport's session manager owns a background task
+    # group that must be running before any /mcp request arrives, or every
+    # request fails with "Task group is not initialized". Mounting the
+    # sub-app alone does not start it — its own lifespan never runs when
+    # mounted into a parent ASGI app, so it must be entered here explicitly.
+    async with mcp.session_manager.run():
+        yield
     logger.info("Shutting down GWS Remote MCP Server")
 
 # Create the FastAPI app
@@ -105,7 +114,11 @@ async def health_check():
     return {"status": "ok", "service": "gws-mcp-server"}
 
 mcp_starlette = mcp.streamable_http_app()
-app.mount("/mcp", mcp_starlette)
+# FastMCP's streamable_http_app() already serves at its configured
+# streamable_http_path (default "/mcp"), so mount it at the root — mounting
+# it at "/mcp" here would nest it as "/mcp/mcp" and break the documented
+# POST /mcp endpoint.
+app.mount("/", mcp_starlette)
 
 if __name__ == "__main__":
     import uvicorn

@@ -29,7 +29,7 @@ This guide covers how to deploy `gws` and its Remote MCP Server in an enterprise
 └──────────────────────────────┬────────────────────────────────────────┘
                                │  HTTPS / Streamable HTTP
 ┌──────────────────────────────▼────────────────────────────────────────┐
-│  Remote MCP Server  (Python or Node.js)                               │
+│  Remote MCP Server  (Python)                                          │
 │                                                                       │
 │  ● Validates JWT against IdP JWKS (signature, issuer, audience)       │
 │  ● Enforces service allowlist  (GWS_ALLOWED_SERVICES)                 │
@@ -154,9 +154,7 @@ No credential file is needed — `gws` discovers the token from the GKE metadata
 
 ## Deploying the Remote MCP Server
 
-The `remote-mcp-server/` directory contains two interchangeable reference implementations. Choose the one that matches your infrastructure.
-
-### Python (recommended for high-concurrency)
+The `remote-mcp-server/` directory contains a Python (FastAPI/FastMCP) reference implementation.
 
 ```bash
 cd remote-mcp-server/python
@@ -165,7 +163,8 @@ pip install -r requirements.txt
 # Minimal launch (auth disabled, for local testing):
 uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
 
-# Production launch:
+# Production launch (gunicorn is not in requirements.txt — install separately):
+pip install gunicorn
 ENABLE_AUTH=true \
 OAUTH_ISSUER=https://my-okta.com/oauth2/default/ \
 OAUTH_AUDIENCE=https://mcp.example.com \
@@ -174,24 +173,14 @@ GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/etc/gws/sa-key.json \
 gunicorn app:app_with_auth -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000
 ```
 
-### Node.js
-
-```bash
-cd remote-mcp-server/nodejs
-npm install
-
-ENABLE_AUTH=true \
-OAUTH_ISSUER=https://my-okta.com/oauth2/default/ \
-OAUTH_AUDIENCE=https://mcp.example.com \
-GWS_ALLOWED_SERVICES=drive,gmail,calendar \
-GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/etc/gws/sa-key.json \
-node server.js
-```
-
 ### Docker
 
 ```dockerfile
 FROM python:3.12-slim
+
+# curl is needed to fetch the gws binary below
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install gws binary
 RUN curl -fsSL https://github.com/googleworkspace/cli/releases/latest/download/gws-linux-amd64.tar.gz \
@@ -199,7 +188,7 @@ RUN curl -fsSL https://github.com/googleworkspace/cli/releases/latest/download/g
 
 WORKDIR /app
 COPY remote-mcp-server/python/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt gunicorn
 COPY remote-mcp-server/python/ .
 
 # Credentials are injected at runtime — never bake them into the image
@@ -393,7 +382,7 @@ Always terminate TLS at the load balancer or ingress layer. Connections from MCP
 
 ### Input validation
 
-The `gws` binary enforces its own input validation (path traversal rejection, URL encoding, resource name validation). Do not bypass it by constructing shell commands manually — always use the argument list (`spawn('gws', [service, ...])`) rather than a shell string.
+The `gws` binary enforces its own input validation (path traversal rejection, URL encoding, resource name validation). Do not bypass it by constructing shell commands manually — always invoke it via an argument list (`asyncio.create_subprocess_exec("gws", service, ...)`) rather than a shell string.
 
 ### Principle of least privilege for service accounts
 
@@ -427,23 +416,6 @@ logging.root.addHandler(handler)
 logging.root.setLevel(logging.INFO)
 ```
 
-### Structured logging (Node.js)
-
-Replace `console.log` with [pino](https://getpino.io/):
-
-```bash
-npm install pino
-```
-
-```js
-import pino from 'pino';
-const log = pino({ level: 'info' });
-
-// Replace console.log / console.error with:
-log.info({ service, command }, 'gws call');
-log.error({ err }, 'subprocess error');
-```
-
 ### gws CLI logs
 
 Enable `gws` JSON-line logs to a directory for later analysis:
@@ -457,7 +429,7 @@ Log files rotate daily. Each line is a JSON object.
 
 ### Health check endpoint
 
-Both servers expose `GET /health` — returns `200 {"status":"ok"}`. Use it for:
+The server exposes `GET /health` — returns `200 {"status":"ok"}`. Use it for:
 - Kubernetes `livenessProbe` and `readinessProbe`
 - ALB / Cloud Load Balancing health checks
 - Uptime monitors
