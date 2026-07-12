@@ -48,3 +48,11 @@ docs/plans/
 # Generated
 demo.mp4
 download.html
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Claude Code agent worktrees (local tooling state, not project content)
+.claude/worktrees/
