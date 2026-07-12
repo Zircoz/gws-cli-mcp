@@ -8,8 +8,20 @@ from mcp.server.fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
-# Initialize FastMCP server
-mcp = FastMCP("GWS Remote MCP Server")
+# Initialize FastMCP server. stateless_http=True avoids server-side session
+# state: without it, sessions live in an in-memory dict on whichever worker
+# process handled `initialize`, so a multi-worker deployment (e.g. gunicorn
+# -w 4, as documented for production) would 404 any follow-up request routed
+# to a different worker.
+mcp = FastMCP("GWS Remote MCP Server", stateless_http=True)
+
+# Service/meta-command names that are never reachable through execute_gws,
+# regardless of GWS_ALLOWED_SERVICES. GWS_ALLOWED_SERVICES is a Workspace
+# *service* allowlist (drive, gmail, ...); it was never meant to gate gws's
+# own CLI meta-commands. In particular "auth" can print decrypted OAuth
+# credentials (`gws auth export --unmasked`) or destroy them (`gws auth
+# logout`), so it must be blocked even when GWS_ALLOWED_SERVICES=*.
+ALWAYS_BLOCKED_SERVICES: Set[str] = {"auth", "schema", "generate-skills"}
 
 # --- Scope / service restriction ---
 #
@@ -50,6 +62,12 @@ async def execute_gws(
     :param args:   Optional list of additional raw CLI arguments.
     """
     # Enforce service allowlist before touching the subprocess.
+    if service in ALWAYS_BLOCKED_SERVICES:
+        return (
+            f"Error: Service '{service}' is a CLI meta-command and is never "
+            f"reachable through execute_gws."
+        )
+
     if ALLOWED_SERVICES is not None and service not in ALLOWED_SERVICES:
         allowed_str = ", ".join(sorted(ALLOWED_SERVICES))
         return (

@@ -166,12 +166,15 @@ uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
 # Production launch (gunicorn is not in requirements.txt — install separately):
 pip install gunicorn
 ENABLE_AUTH=true \
-OAUTH_ISSUER=https://my-okta.com/oauth2/default/ \
+OAUTH_ISSUER=https://my-okta.com/oauth2/default \
+JWKS_URI=https://my-okta.com/oauth2/default/v1/keys \
 OAUTH_AUDIENCE=https://mcp.example.com \
 GWS_ALLOWED_SERVICES=drive,gmail,calendar \
 GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/etc/gws/sa-key.json \
 gunicorn app:app_with_auth -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000
 ```
+
+Multiple `-w` workers are safe here because `server.py` constructs `FastMCP(..., stateless_http=True)` — each request is handled independently rather than relying on server-side session state pinned to whichever worker process created it.
 
 ### Docker
 
@@ -183,7 +186,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install gws binary
-RUN curl -fsSL https://github.com/googleworkspace/cli/releases/latest/download/gws-linux-amd64.tar.gz \
+RUN curl -fsSL https://github.com/googleworkspace/cli/releases/latest/download/google-workspace-cli-x86_64-unknown-linux-gnu.tar.gz \
     | tar -xz -C /usr/local/bin
 
 WORKDIR /app
@@ -296,11 +299,11 @@ The Remote MCP Server acts as an **OAuth 2.1 Resource Server**. It validates inc
 | Variable | Description | Example |
 |---|---|---|
 | `ENABLE_AUTH` | Enable JWT validation (`true` / `false`) | `true` |
-| `OAUTH_ISSUER` | IdP issuer URL (must match `iss` claim) | `https://my-company.okta.com/oauth2/default/` |
+| `OAUTH_ISSUER` | IdP issuer URL (must exactly match the token's `iss` claim, including trailing-slash presence/absence) | `https://my-company.okta.com/oauth2/default` |
 | `OAUTH_AUDIENCE` | Expected `aud` claim (canonical server URI) | `https://mcp.example.com` |
-| `JWKS_URI` | JWKS endpoint for public key fetch | `https://my-company.okta.com/oauth2/default/v1/keys` |
+| `JWKS_URI` | JWKS endpoint for public key fetch. Defaults to `<OAUTH_ISSUER>/.well-known/jwks.json`, which is correct for Auth0-style IdPs but **not** Okta (see below) — set it explicitly whenever your IdP doesn't use that path. | `https://my-company.okta.com/oauth2/default/v1/keys` |
 | `REQUIRED_SCOPES` | Space-separated scopes the JWT must contain ≥1 of | `gws:read gws:write` |
-| `PORT` | Server port | `8000` |
+| `PORT` | Server port. Only honored by the `python app.py` dev-mode entry point — the production `uvicorn`/`gunicorn` commands and the Dockerfile `CMD` bind an explicit port and must be edited to match if you change it. | `8000` |
 
 ### Okta
 
@@ -308,7 +311,8 @@ The Remote MCP Server acts as an **OAuth 2.1 Resource Server**. It validates inc
 2. Add a custom authorization server (or use the `default` server).
 3. Define custom scopes: `gws:read`, `gws:write`, etc.
 4. Create a policy and rule granting the agent's client credentials the scopes.
-5. Set `OAUTH_ISSUER` to the authorization server issuer URL.
+5. Set `OAUTH_ISSUER` to the authorization server issuer URL, **without** a trailing slash (it must exactly match the `iss` claim Okta puts in issued tokens).
+6. Set `JWKS_URI` explicitly to `<issuer>/v1/keys` — Okta does not serve JWKS at the `.well-known/jwks.json` path this server defaults to.
 
 ### Auth0
 
@@ -465,7 +469,9 @@ spec:
             - name: ENABLE_AUTH
               value: "true"
             - name: OAUTH_ISSUER
-              value: "https://my-company.okta.com/oauth2/default/"
+              value: "https://my-company.okta.com/oauth2/default"
+            - name: JWKS_URI
+              value: "https://my-company.okta.com/oauth2/default/v1/keys"
             - name: OAUTH_AUDIENCE
               value: "https://mcp.example.com"
             - name: GWS_ALLOWED_SERVICES
@@ -515,10 +521,12 @@ gcloud run deploy gws-mcp-server \
   --region=us-central1 \
   --platform=managed \
   --no-allow-unauthenticated \
-  --set-env-vars="ENABLE_AUTH=true,OAUTH_ISSUER=https://my-company.okta.com/oauth2/default/,GWS_ALLOWED_SERVICES=drive,gmail,calendar" \
-  --set-secrets="GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=gws-sa-key:latest" \
+  --set-env-vars="ENABLE_AUTH=true,OAUTH_ISSUER=https://my-company.okta.com/oauth2/default,JWKS_URI=https://my-company.okta.com/oauth2/default/v1/keys,GWS_ALLOWED_SERVICES=drive,gmail,calendar,GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/etc/gws/sa-key.json" \
+  --set-secrets="/etc/gws/sa-key.json=gws-sa-key:latest" \
   --service-account=gws-mcp-server@<PROJECT_ID>.iam.gserviceaccount.com
 ```
+
+`--set-secrets` here mounts the secret as a *file* at `/etc/gws/sa-key.json` (`path=secret:version` syntax) — `gws` requires `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` to point at a file on disk, not the raw secret value, so injecting the secret directly into that env var (`GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=gws-sa-key:latest`) would put the JSON key body itself in the variable and every `gws` call would fail with "file does not exist".
 
 Use `--no-allow-unauthenticated` to enforce Google IAP in front, or manage JWT validation inside the server with `ENABLE_AUTH=true`.
 
@@ -539,7 +547,7 @@ Install `gws` on the host machine or in the container image before starting the 
 npm install -g @googleworkspace/cli
 
 # Or download a pre-built binary:
-curl -fsSL https://github.com/googleworkspace/cli/releases/latest/download/gws-linux-amd64.tar.gz \
+curl -fsSL https://github.com/googleworkspace/cli/releases/latest/download/google-workspace-cli-x86_64-unknown-linux-gnu.tar.gz \
   | tar -xz -C /usr/local/bin
 ```
 

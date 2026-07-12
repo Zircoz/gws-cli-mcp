@@ -30,14 +30,16 @@ It is designed for **Enterprise Deployments** and includes OAuth 2.1 authorizati
 | `ENABLE_AUTH` | Set to `true` to enable OAuth 2.1 Bearer token validation. | `false` (for local testing) |
 | `OAUTH_ISSUER` | The URL of your Authorization Server (IdP). | `https://your-idp.example.com/` |
 | `OAUTH_AUDIENCE` | The expected `aud` claim in the JWT. Usually the Canonical Server URI of this MCP server. | `https://mcp.example.com` |
-| `JWKS_URI` | The URI to fetch public keys to verify JWT signatures. | `$OAUTH_ISSUER.well-known/jwks.json` |
+| `JWKS_URI` | The URI to fetch public keys to verify JWT signatures. Defaults to `<OAUTH_ISSUER>/.well-known/jwks.json` (trailing-slash tolerant), which is correct for Auth0-style IdPs but **not** Okta — Okta serves JWKS at `<issuer>/v1/keys` instead, so set this explicitly for Okta deployments. | `$OAUTH_ISSUER/.well-known/jwks.json` |
 | `REQUIRED_SCOPES` | Space-separated list: the JWT must contain at least one of these scopes. | `gws:read gws:write` |
-| `GWS_ALLOWED_SERVICES` | Comma-separated list of `gws` service names clients may invoke. Set to `*` or omit to allow all. | *(unrestricted)* |
-| `PORT` | The HTTP port to bind to. | `8000` |
+| `GWS_ALLOWED_SERVICES` | Comma-separated list of `gws` service names clients may invoke. Set to `*` or omit to allow all. Note `auth`, `schema`, and `generate-skills` are CLI meta-commands and are never reachable through `execute_gws`, even under `*`. | *(unrestricted)* |
+| `PORT` | The HTTP port to bind to. Only honored by the `python app.py` dev-mode entry point below — the `uvicorn`/`gunicorn` commands bind an explicit port and must be edited to match if you change it. | `8000` |
 
 ### 2. Restricting which services MCP clients can call
 
 Set `GWS_ALLOWED_SERVICES` to limit the `gws` services accessible through this server. Requests for any service not in the list are rejected **before** a subprocess is spawned, so there is no risk of the CLI accidentally executing a disallowed command.
+
+`auth`, `schema`, and `generate-skills` are always rejected regardless of `GWS_ALLOWED_SERVICES`, including `*` — these are `gws` CLI meta-commands rather than Workspace services, and `auth` in particular can print decrypted OAuth credentials (`gws auth export --unmasked`) or destroy them (`gws auth logout`). The allowlist only governs which Workspace *services* (`drive`, `gmail`, ...) a client may reach.
 
 ```bash
 # Only allow Drive, Gmail, and Calendar
@@ -102,12 +104,13 @@ pip install -r requirements.txt
 
 # Start the server
 ENABLE_AUTH=true \
-OAUTH_ISSUER="https://my-okta.com/oauth2/default/" \
+OAUTH_ISSUER="https://my-okta.com/oauth2/default" \
+JWKS_URI="https://my-okta.com/oauth2/default/v1/keys" \
 GWS_ALLOWED_SERVICES=drive,gmail,calendar \
 uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
 ```
 
-For production, install `gunicorn` (not pinned in `requirements.txt`) and run it with `uvicorn` workers:
+For production, install `gunicorn` (not pinned in `requirements.txt`) and run it with `uvicorn` workers. Multiple `-w` workers are safe because `server.py` constructs `FastMCP(..., stateless_http=True)`, so no server-side session state is pinned to a particular worker:
 
 ```bash
 pip install gunicorn

@@ -1,15 +1,16 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+import anyio
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 import jwt
 from jwt import PyJWKClient
 
-# Configure logging before importing server — server.py logs at import time,
-# and logging.info() implicitly calls basicConfig() at WARNING level on
-# first use, which would silently make a later basicConfig() call here a
-# no-op if it hasn't run yet.
+# Configure logging before importing server — server.py logs two INFO lines
+# at import time (its allowlist summary), and this basicConfig() call must
+# already be in effect for those to print at INFO rather than being dropped
+# by the logging module's default WARNING level.
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gws-mcp-server")
 
@@ -19,7 +20,11 @@ from server import mcp
 # OAuth 2.1 Configuration
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://your-idp.example.com/")
 OAUTH_AUDIENCE = os.getenv("OAUTH_AUDIENCE", "https://mcp.example.com") # Canonical Server URI
-JWKS_URI = os.getenv("JWKS_URI", f"{OAUTH_ISSUER}.well-known/jwks.json")
+# Trailing-slash-tolerant default: many IdPs (e.g. Auth0) publish JWKS at
+# "<issuer>/.well-known/jwks.json"; Okta does not use this path at all (its
+# JWKS lives at "<issuer>/v1/keys") and JWKS_URI must be set explicitly for
+# it — see docs/enterprise-deployment.md's Okta section.
+JWKS_URI = os.getenv("JWKS_URI", f"{OAUTH_ISSUER.rstrip('/')}/.well-known/jwks.json")
 ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").lower() == "true" # Disabled by default for local testing
 REQUIRED_SCOPES = os.getenv("REQUIRED_SCOPES", "gws:read gws:write").split()
 
@@ -74,8 +79,21 @@ class ASGIAuthMiddleware:
         try:
             token = auth_header.split(" ")[1]
             client = get_jwks_client()
-            signing_key = client.get_signing_key_from_jwt(token)
-            payload = jwt.decode(token, signing_key.key, algorithms=["RS256", "ES256"], audience=OAUTH_AUDIENCE, issuer=OAUTH_ISSUER)
+            # PyJWKClient does a synchronous HTTP fetch (cached, but still
+            # blocking on a cache miss); run it off the event loop so a slow
+            # or unreachable IdP doesn't stall every other in-flight request
+            # (including long-lived SSE streams) on this worker.
+            signing_key = await anyio.to_thread.run_sync(
+                client.get_signing_key_from_jwt, token
+            )
+            payload = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256", "ES256"],
+                audience=OAUTH_AUDIENCE,
+                issuer=OAUTH_ISSUER,
+                options={"require": ["exp"]},
+            )
 
             # Check scopes (basic enterprise security practice)
             token_scopes = payload.get("scope", "").split()
@@ -122,5 +140,9 @@ app.mount("/", mcp_starlette)
 
 if __name__ == "__main__":
     import uvicorn
-    # When running directly
-    uvicorn.run("app:app_with_auth", host="0.0.0.0", port=8000, reload=True)
+    # When running directly. Note this only covers the dev-mode `python
+    # app.py` path — the documented production commands (uvicorn/gunicorn
+    # CLI invocations, the Dockerfile CMD) bind an explicit port and must be
+    # updated to match if you change the default here.
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app_with_auth", host="0.0.0.0", port=port, reload=True)
