@@ -62,13 +62,47 @@ Error: Service 'admin-reports' is not permitted on this server.
 Allowed services: calendar, drive, gmail
 ```
 
+### 3. Restricting which clients can connect — marking OAuth scopes as allowed
+
+`REQUIRED_SCOPES` (Python only) controls which *callers* may reach the `execute_gws` tool at all, independent of which services they're allowed to invoke once connected. This is enforced by `ASGIAuthMiddleware` in `python/app.py`, which reads the space-delimited `scope` claim out of the verified JWT and compares it against `REQUIRED_SCOPES`:
+
+```python
+token_scopes = payload.get("scope", "").split()
+if REQUIRED_SCOPES and not any(scope in token_scopes for scope in REQUIRED_SCOPES):
+    ...  # 401 insufficient_scope
+```
+
+This is an **OR** match — the token needs *any one* of the scopes listed in `REQUIRED_SCOPES`, not all of them.
+
+To mark a scope as "allowed", it has to exist on both sides:
+
+1. **On your IdP**, define the scope(s) and grant them to the client application that will call this server:
+   - **Okta**: Authorization Server → *Scopes* tab → add a custom scope (e.g. `gws:read`, `gws:write`), then include it in the client's requested scopes/consent.
+   - **Auth0**: API → *Permissions* tab → add the scope, then assign it to the client's Application/API authorization (or include it in the `scope` parameter of the client's token request for machine-to-machine flows).
+   - **Keycloak**: Client Scopes → create a client scope named after your scope string, then add it as a *Default* or *Optional* client scope on the client so it's included in issued access tokens.
+   - The important part is that the resulting access token's `scope` claim (space-delimited string) contains the scope string you intend to require.
+2. **On this server**, set `REQUIRED_SCOPES` to the same string(s), e.g.:
+
+```bash
+# Accept tokens carrying either gws:read or gws:write
+REQUIRED_SCOPES="gws:read gws:write"
+
+# Require a single, more specific scope
+REQUIRED_SCOPES="gws:execute"
+```
+
+   Leaving `REQUIRED_SCOPES` unset falls back to the default `gws:read gws:write`; setting it to an empty string disables the scope check entirely (any authenticated token is accepted).
+
+> [!WARNING]
+> **The Node.js server does not enforce `REQUIRED_SCOPES`.** `nodejs/server.js` verifies the JWT's signature, issuer, and audience, but never inspects the `scope` claim — any successfully authenticated token is accepted regardless of its scopes. If per-scope access control matters for your deployment, use the Python implementation or add scope enforcement to `authMiddleware` in `server.js` before relying on it in production.
+
 **Combining layers for defence-in-depth:**
 
 1. **Google OAuth scopes** on the `gws` credentials — define the maximum Google Workspace permissions at the API level (e.g., `drive.readonly` credentials block all Drive write calls regardless of what the MCP server permits).
 2. **`GWS_ALLOWED_SERVICES`** — restrict which services the MCP server will proxy.
-3. **`REQUIRED_SCOPES`** on the IdP JWT — control which agents can connect to the server at all.
+3. **`REQUIRED_SCOPES`** on the IdP JWT — control which agents can connect to the server at all (Python only, see above).
 
-### 3. Running the Python Server
+### 4. Running the Python Server
 
 ```bash
 cd python
@@ -81,13 +115,14 @@ GWS_ALLOWED_SERVICES=drive,gmail,calendar \
 uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
 ```
 
-For production, use `gunicorn` with `uvicorn` workers:
+For production, install `gunicorn` (not pinned in `requirements.txt`) and run it with `uvicorn` workers:
 
 ```bash
+pip install gunicorn
 gunicorn app:app_with_auth -k uvicorn.workers.UvicornWorker -w 4 --bind 0.0.0.0:8000
 ```
 
-### 4. Running the Node.js Server
+### 5. Running the Node.js Server
 
 ```bash
 cd nodejs
@@ -99,7 +134,7 @@ GWS_ALLOWED_SERVICES=drive,gmail,calendar \
 node server.js
 ```
 
-### 5. Health Checks
+### 6. Health Checks
 
 For Kubernetes or Load Balancers (AWS ALB, etc.), both servers expose a public `/health` endpoint that bypasses OAuth verification:
 
@@ -108,17 +143,21 @@ curl -I http://localhost:8000/health
 # HTTP/1.1 200 OK
 ```
 
-### 6. Logging and Observability
+Response bodies differ slightly between implementations: the Python server returns `{"status": "ok", "service": "gws-mcp-server"}`, the Node.js server returns `{"status": "ok", "service": "gws-mcp-server-node"}`.
+
+The Python server additionally leaves FastAPI's auto-generated `/docs` (Swagger UI) and `/openapi.json` endpoints unauthenticated (see `ASGIAuthMiddleware` in `app.py`). These only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them — but disable or reverse-proxy them away in security-sensitive deployments if you don't want the API docs page publicly reachable.
+
+### 7. Logging and Observability
 
 - **Python**: Uses the standard `logging` module. Configure `logging.basicConfig` in `app.py` to emit JSON logs if your log aggregator (Datadog, Splunk, ELK) prefers structured logs.
 - **Node.js**: Currently uses `console.log`. For enterprise use, consider replacing it with a structured logger like `pino` or `winston`.
 - The `gws` CLI invocations are logged. Ensure you do not log the `--params` content if it contains PII or sensitive data.
 
-### 7. Client Connection
+### 8. Client Connection
 
 MCP Clients must connect using the **Streamable HTTP Transport** (supported by `@modelcontextprotocol/sdk` >= 1.4).
 
-- **Streamable Endpoint**: `POST /mcp`
+- **Streamable Endpoint**: `/mcp` — both implementations mount the transport across all HTTP methods it needs (`POST` for requests, `GET` for the SSE stream, `DELETE` to terminate a session), so route all three to the same URL rather than `POST` alone.
 
 Clients **must** include the header:
 ```
