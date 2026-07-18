@@ -27,13 +27,41 @@ It is designed for **Enterprise Deployments** and includes OAuth 2.1 authorizati
 
 | Variable | Description | Default |
 |---|---|---|
-| `ENABLE_AUTH` | Set to `true` to enable OAuth 2.1 Bearer token validation. | `false` (for local testing) |
+| `ENABLE_AUTH` | Must be set to exactly `true` or `false`. **The server refuses to start** if it is unset, empty, or any other value (e.g. `1`, `yes`) — see "Fail-closed startup" below. | *(required — no implicit default)* |
+| `ALLOW_INSECURE_NO_AUTH` | Explicit opt-out for local testing: set to `true` to let the server start with auth disabled when `ENABLE_AUTH` is unset/ambiguous. Loudly logs a warning. Never use for a network-exposed deployment. | `false` |
 | `OAUTH_ISSUER` | The URL of your Authorization Server (IdP). | `https://your-idp.example.com/` |
 | `OAUTH_AUDIENCE` | The expected `aud` claim in the JWT. Usually the Canonical Server URI of this MCP server. | `https://mcp.example.com` |
 | `JWKS_URI` | The URI to fetch public keys to verify JWT signatures. Defaults to `<OAUTH_ISSUER>/.well-known/jwks.json` (trailing-slash tolerant), which is correct for Auth0-style IdPs but **not** Okta — Okta serves JWKS at `<issuer>/v1/keys` instead, so set this explicitly for Okta deployments. | `$OAUTH_ISSUER/.well-known/jwks.json` |
-| `REQUIRED_SCOPES` | Space-separated list: the JWT must contain at least one of these scopes. | `gws:read gws:write` |
-| `GWS_ALLOWED_SERVICES` | Comma-separated list of `gws` service names clients may invoke. Set to `*` or omit to allow all. Note `auth`, `schema`, and `generate-skills` are CLI meta-commands and are never reachable through `execute_gws`, even under `*`. | *(unrestricted)* |
+| `REQUIRED_SCOPES` | Space-separated list: the JWT must contain at least one of these scopes. An explicit empty string with `ENABLE_AUTH=true` is treated as a misconfiguration (see `REQUIRE_SCOPES` below) rather than silently accepting any scope. | `gws:read gws:write` |
+| `REQUIRE_SCOPES` | Set to `false` to explicitly opt out of scope enforcement when you intend `REQUIRED_SCOPES=""` to mean "no scope required." Without this, an empty `REQUIRED_SCOPES` with auth enabled refuses to start. | `true` |
+| `GWS_ALLOWED_SERVICES` | Comma-separated list of `gws` service names clients may invoke. Set to `*` or omit to allow all. Note `auth`, `schema`, and `generate-skills` are CLI meta-commands and are never reachable through `execute_gws`, even under `*`; the `service:version` Discovery syntax is always rejected too (see §2). | *(unrestricted)* |
+| `GWS_PER_USER_TOKEN` | Set to `true` to enable per-request credential isolation for multi-tenant deployments — each call executes as the calling user's own Google identity instead of the host's. Requires `ENABLE_AUTH=true`. See §3.5. | `false` |
+| `GWS_USER_TOKEN_CLAIM` | When `GWS_PER_USER_TOKEN=true`, the name of a claim in the validated JWT payload to read the caller's Google token from. Takes priority over `GWS_USER_TOKEN_HEADER` if set. | *(unset — use header)* |
+| `GWS_USER_TOKEN_HEADER` | When `GWS_PER_USER_TOKEN=true` and `GWS_USER_TOKEN_CLAIM` is unset, the forwarded HTTP header the client uses to carry its Google token. | `X-GWS-User-Token` |
+| `EXPOSE_API_DOCS` | Set to `true` to mount and unauthenticate FastAPI's `/docs` (Swagger UI) and `/openapi.json`. Disabled by default — an unauthenticated schema/docs page is unnecessary information-disclosure surface on a network-exposed server. | `false` |
 | `PORT` | The HTTP port to bind to. Only honored by the `python app.py` dev-mode entry point below — the `uvicorn`/`gunicorn` commands bind an explicit port and must be edited to match if you change it. | `8000` |
+
+#### Fail-closed startup
+
+`ENABLE_AUTH` has no implicit default — the server raises at import time (before it ever binds a port) if it's unset, empty, or anything other than exactly `"true"`/`"false"` (case-insensitive), *unless* `ALLOW_INSECURE_NO_AUTH=true` is also set. This closes the gap where a forgotten env var used to silently disable authentication for every path including `/mcp`. Similarly, an explicit empty `REQUIRED_SCOPES=""` combined with `ENABLE_AUTH=true` now refuses to start unless `REQUIRE_SCOPES=false` is set — it previously disabled the scope check silently.
+
+```bash
+# Refuses to start: ENABLE_AUTH unset
+uvicorn app:app_with_auth --port 8000
+# RuntimeError: ENABLE_AUTH=None is unset or ambiguous ...
+
+# Refuses to start: "1" is not "true"/"false"
+ENABLE_AUTH=1 uvicorn app:app_with_auth --port 8000
+
+# Starts, auth on
+ENABLE_AUTH=true OAUTH_ISSUER=... uvicorn app:app_with_auth --port 8000
+
+# Starts, auth off — explicit and intentional (documented local-dev workflow)
+ENABLE_AUTH=false uvicorn app:app_with_auth --port 8000
+
+# Starts, auth off despite an unset/ambiguous ENABLE_AUTH — explicit, loud opt-out
+ALLOW_INSECURE_NO_AUTH=true uvicorn app:app_with_auth --port 8000
+```
 
 ### 2. Restricting which services MCP clients can call
 
@@ -48,15 +76,33 @@ GWS_ALLOWED_SERVICES=drive,gmail,calendar
 # Broader deployment
 GWS_ALLOWED_SERVICES=drive,gmail,calendar,sheets,docs,tasks
 
-# Unrestricted (default — not recommended for production)
+# Unrestricted — every service gws knows about, not just Workspace ones.
+# gws resolves any Google Discovery API via "service:version" syntax for
+# services it doesn't recognize by name (e.g. "compute:v1"); execute_gws
+# rejects that syntax outright (see below), so even "*" here only reaches
+# gws's own named service list, never an arbitrary Discovery API.
 GWS_ALLOWED_SERVICES=*
 ```
+
+**The allowlist check, in order, before any subprocess is spawned:**
+
+1. `auth`/`schema`/`generate-skills` are always rejected (see above), regardless of `GWS_ALLOWED_SERVICES`.
+2. A `service` containing `:` (e.g. `compute:v1`, `drive:v3`) is always rejected — this closes the Discovery `service:version` syntax as a way to reach APIs outside the allowlist's intent.
+3. The service name is normalized to its canonical Discovery API name via the same alias table `gws` itself uses (`crates/google-workspace/src/services.rs`) — so `reports` and `admin-reports` are treated as the same service, whichever spelling you put in `GWS_ALLOWED_SERVICES` or the client passes as `service`.
+4. The normalized name is checked against `GWS_ALLOWED_SERVICES`.
 
 **Error response when a client requests a blocked service:**
 
 ```
 Error: Service 'admin-reports' is not permitted on this server.
 Allowed services: calendar, drive, gmail
+```
+
+**Error response when a client uses `service:version` syntax:**
+
+```
+Error: Service 'compute:v1' uses the 'api:version' Discovery syntax, which is
+not permitted through execute_gws. ...
 ```
 
 ### 3. Restricting which clients can connect — marking OAuth scopes as allowed
@@ -88,13 +134,34 @@ REQUIRED_SCOPES="gws:read gws:write"
 REQUIRED_SCOPES="gws:execute"
 ```
 
-   Leaving `REQUIRED_SCOPES` unset falls back to the default `gws:read gws:write`; setting it to an empty string disables the scope check entirely (any authenticated token is accepted).
+   Leaving `REQUIRED_SCOPES` unset falls back to the default `gws:read gws:write`. Setting it to an empty string is treated as a misconfiguration when `ENABLE_AUTH=true` — the server refuses to start unless you also set `REQUIRE_SCOPES=false`, an explicit acknowledgment that you intend "no scope required" rather than having forgotten to set scopes.
 
 **Combining layers for defence-in-depth:**
 
 1. **Google OAuth scopes** on the `gws` credentials — define the maximum Google Workspace permissions at the API level (e.g., `drive.readonly` credentials block all Drive write calls regardless of what the MCP server permits).
 2. **`GWS_ALLOWED_SERVICES`** — restrict which services the MCP server will proxy.
 3. **`REQUIRED_SCOPES`** on the IdP JWT — control which agents can connect to the server at all (see above).
+4. **`GWS_PER_USER_TOKEN`** — for multi-tenant deployments, scope each call to the calling user's own Google identity instead of the host's (see §3.5).
+
+### 3.5. Multi-tenant deployments: per-request credential isolation
+
+By default, this server executes **every** request as the single Google identity configured on the host process (`GOOGLE_WORKSPACE_CLI_TOKEN` / `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` / ADC). That's the right model for a single-tenant deployment, but with `stateless_http=True` one worker process serves many concurrent callers — so with only host credentials, every caller acts as the same Google account regardless of who authenticated. If you're deploying this server for multiple end users who should each act as themselves, set `GWS_PER_USER_TOKEN=true`.
+
+```bash
+GWS_PER_USER_TOKEN=true \
+ENABLE_AUTH=true \
+GWS_USER_TOKEN_HEADER=X-GWS-User-Token \
+uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
+```
+
+With this on, `ASGIAuthMiddleware` extracts a Google access token for the *calling user* on every request — after validating the caller's JWT — from one of two sources you choose:
+
+- **`GWS_USER_TOKEN_CLAIM`** — a claim name in the already-validated JWT payload (e.g. if your IdP embeds a Google token via token exchange). Takes priority if set.
+- **`GWS_USER_TOKEN_HEADER`** (default `X-GWS-User-Token`) — a forwarded HTTP header the client sets to its own Google access token.
+
+That token is injected into the `gws` child process's environment (`GOOGLE_WORKSPACE_CLI_TOKEN`) for that one call only — built as a request-local dict, never written to `os.environ`, and never shared across concurrent requests (it's carried through a `contextvars.ContextVar`, not a module global, specifically because a plain global would leak across concurrent callers under `stateless_http`). If no token is available for a request, `execute_gws` returns an error rather than silently falling back to the host's credentials — the Rust CLI itself would otherwise fall through `GOOGLE_WORKSPACE_CLI_TOKEN=""` to `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`/ADC, which is exactly the confused-deputy behavior this mode exists to prevent.
+
+`GWS_PER_USER_TOKEN=true` requires `ENABLE_AUTH=true` — the server refuses to start otherwise, since per-user isolation is meaningless without a validated caller identity to isolate by.
 
 ### 4. Running the Server
 
@@ -128,12 +195,12 @@ curl -I http://localhost:8000/health
 
 The response body is `{"status": "ok", "service": "gws-mcp-server"}`.
 
-The server additionally leaves FastAPI's auto-generated `/docs` (Swagger UI) and `/openapi.json` endpoints unauthenticated (see `ASGIAuthMiddleware` in `app.py`). These only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them — but disable or reverse-proxy them away in security-sensitive deployments if you don't want the API docs page publicly reachable.
+`/docs` (Swagger UI) and `/openapi.json` are **not** mounted by default — an unauthenticated schema/docs page is unnecessary information-disclosure surface on a network-exposed server. Set `EXPOSE_API_DOCS=true` to restore them (e.g. for local development convenience); when enabled, they remain unauthenticated (see `ASGIAuthMiddleware` in `app.py`) and only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them.
 
 ### 6. Logging and Observability
 
 - Uses the standard `logging` module. Configure `logging.basicConfig` in `app.py` to emit JSON logs if your log aggregator (Datadog, Splunk, ELK) prefers structured logs. Note that `app.py` calls `logging.basicConfig()` **before** importing `server.py` — importing first would let `server.py`'s own logging calls implicitly configure the root logger at the default `WARNING` level, silently swallowing the `INFO` logs this server relies on for auditing.
-- The `gws` CLI invocations are logged. Ensure you do not log the `--params` content if it contains PII or sensitive data.
+- Each `gws` CLI invocation logs only the `service` and `command` (e.g. `service='gmail' command='messages send'`) — never `--params` or `args`, which can carry request PII (message bodies, search queries, recipient addresses). The Google credential itself is passed via the child process's environment, not the command line, so it never appears in logs either way.
 
 ### 7. Client Connection
 
@@ -146,3 +213,13 @@ Clients **must** include the header:
 Authorization: Bearer <YOUR_ACCESS_TOKEN>
 ```
 If the token is invalid or missing, the server returns `401 Unauthorized` with a `WWW-Authenticate` header conforming to [RFC 6750](https://datatracker.ietf.org/doc/html/rfc6750) and the MCP Authorization Spec.
+
+### 8. Testing
+
+```bash
+cd python
+pip install -r requirements-dev.txt
+pytest
+```
+
+Covers the service allowlist (`:` rejection, alias normalization, always-blocked meta-commands), per-request token isolation (including a concurrency test asserting two simultaneous calls never observe each other's token), the `ENABLE_AUTH`/`REQUIRED_SCOPES` fail-closed startup guards, and the logging redaction.

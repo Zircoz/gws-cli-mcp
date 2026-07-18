@@ -235,6 +235,8 @@ GWS_ALLOWED_SERVICES=drive,gmail,calendar,sheets,docs,tasks
 GWS_ALLOWED_SERVICES=*
 ```
 
+The check is alias-aware and closes the `service:version` Discovery escape hatch: a service name containing `:` (e.g. `compute:v1`) is always rejected, and aliases (`reports` / `admin-reports`) are normalized to the same canonical name before comparison, so allowing one spelling reliably allows both. Even `GWS_ALLOWED_SERVICES=*` only ever reaches `gws`'s own named service list — not arbitrary Google Discovery APIs — because the `:` syntax is rejected regardless of the allowlist setting.
+
 **Available service names:**
 
 | Name | API |
@@ -288,6 +290,10 @@ For fine-grained per-client restrictions, issue different JWTs to different agen
 
 Deploy a separate MCP server instance per role, each with its own `GWS_ALLOWED_SERVICES` and its own `gws` credentials carrying only the necessary Google OAuth scopes.
 
+### Layer 4: True per-user credential isolation (`GWS_PER_USER_TOKEN`)
+
+The per-role deployment pattern above still runs every caller of a given server instance as that instance's one host identity — it partitions by *role*, not by *individual user*. If your deployment instead needs each authenticated end user to act as themselves against Google (not as a shared service identity), set `GWS_PER_USER_TOKEN=true`. Each request then executes with the calling user's own Google access token — extracted per-request from the validated JWT (or a forwarded header) and injected only into that one `gws` child process — instead of the host's credentials. This requires `ENABLE_AUTH=true`, since it depends on a validated caller identity to isolate by. See the Python server's README §3.5 for the full mechanism and configuration.
+
 ---
 
 ## Enterprise IdP integration
@@ -298,11 +304,16 @@ The Remote MCP Server acts as an **OAuth 2.1 Resource Server**. It validates inc
 
 | Variable | Description | Example |
 |---|---|---|
-| `ENABLE_AUTH` | Enable JWT validation (`true` / `false`) | `true` |
+| `ENABLE_AUTH` | Enable JWT validation. Must be exactly `true` or `false` — the server refuses to start if it's unset/ambiguous, unless `ALLOW_INSECURE_NO_AUTH=true` is also set (local testing only). | `true` |
+| `ALLOW_INSECURE_NO_AUTH` | Explicit, loudly-logged opt-out letting the server start with auth disabled when `ENABLE_AUTH` is unset/ambiguous. Never set this for a production deployment. | `false` |
 | `OAUTH_ISSUER` | IdP issuer URL (must exactly match the token's `iss` claim, including trailing-slash presence/absence) | `https://my-company.okta.com/oauth2/default` |
 | `OAUTH_AUDIENCE` | Expected `aud` claim (canonical server URI) | `https://mcp.example.com` |
 | `JWKS_URI` | JWKS endpoint for public key fetch. Defaults to `<OAUTH_ISSUER>/.well-known/jwks.json`, which is correct for Auth0-style IdPs but **not** Okta (see below) — set it explicitly whenever your IdP doesn't use that path. | `https://my-company.okta.com/oauth2/default/v1/keys` |
-| `REQUIRED_SCOPES` | Space-separated scopes the JWT must contain ≥1 of | `gws:read gws:write` |
+| `REQUIRED_SCOPES` | Space-separated scopes the JWT must contain ≥1 of. An explicit empty value with `ENABLE_AUTH=true` refuses to start unless `REQUIRE_SCOPES=false` is also set. | `gws:read gws:write` |
+| `REQUIRE_SCOPES` | Set to `false` to explicitly opt out of scope enforcement (only needed alongside an intentional empty `REQUIRED_SCOPES`). | `true` |
+| `GWS_PER_USER_TOKEN` | Multi-tenant mode: scope each request to the calling user's own Google identity instead of the host's. Requires `ENABLE_AUTH=true`. See the Python server's README §3.5. | `false` |
+| `GWS_USER_TOKEN_CLAIM` / `GWS_USER_TOKEN_HEADER` | Where to read the caller's Google token from when `GWS_PER_USER_TOKEN=true` — a JWT claim name, or (default) the `X-GWS-User-Token` forwarded header. | *(unset)* / `X-GWS-User-Token` |
+| `EXPOSE_API_DOCS` | Mount `/docs` and `/openapi.json`, unauthenticated. Disabled by default. | `false` |
 | `PORT` | Server port. Only honored by the `python app.py` dev-mode entry point — the production `uvicorn`/`gunicorn` commands and the Dockerfile `CMD` bind an explicit port and must be edited to match if you change it. | `8000` |
 
 ### Okta

@@ -1,6 +1,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
+from typing import Dict, Optional
 import anyio
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
@@ -14,8 +15,10 @@ from jwt import PyJWKClient
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("gws-mcp-server")
 
-# Import our FastMCP server instance
-from server import mcp
+# Import our FastMCP server instance, along with the per-request token
+# machinery it owns: USER_TOKEN (the ContextVar this middleware populates)
+# and PER_USER_TOKEN_MODE (whether per-user credential isolation is on).
+from server import mcp, USER_TOKEN, PER_USER_TOKEN_MODE
 
 # OAuth 2.1 Configuration
 OAUTH_ISSUER = os.getenv("OAUTH_ISSUER", "https://your-idp.example.com/")
@@ -25,8 +28,115 @@ OAUTH_AUDIENCE = os.getenv("OAUTH_AUDIENCE", "https://mcp.example.com") # Canoni
 # JWKS lives at "<issuer>/v1/keys") and JWKS_URI must be set explicitly for
 # it — see docs/enterprise-deployment.md's Okta section.
 JWKS_URI = os.getenv("JWKS_URI", f"{OAUTH_ISSUER.rstrip('/')}/.well-known/jwks.json")
-ENABLE_AUTH = os.getenv("ENABLE_AUTH", "false").lower() == "true" # Disabled by default for local testing
-REQUIRED_SCOPES = os.getenv("REQUIRED_SCOPES", "gws:read gws:write").split()
+
+# --- ENABLE_AUTH: fail closed ---
+#
+# A missing/unset ENABLE_AUTH must never silently disable authentication on a
+# network-exposed server. ENABLE_AUTH must be exactly "true" or exactly
+# "false" (case-insensitive); anything else — unset, empty, "1", "yes",
+# typos — is a startup error unless the operator explicitly opts into running
+# without a recognized value via ALLOW_INSECURE_NO_AUTH=true (local testing
+# only; loudly logged).
+_ENABLE_AUTH_RAW = os.getenv("ENABLE_AUTH")
+_ALLOW_INSECURE_NO_AUTH = os.getenv("ALLOW_INSECURE_NO_AUTH", "false").lower() == "true"
+
+
+def _resolve_enable_auth(raw: Optional[str], allow_insecure: bool) -> bool:
+    if raw is not None:
+        normalized = raw.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    if allow_insecure:
+        logger.warning(
+            f"ENABLE_AUTH={raw!r} is unset or not exactly 'true'/'false'; "
+            f"ALLOW_INSECURE_NO_AUTH=true is set, so this server is "
+            f"starting WITHOUT OAuth authentication. Every request reaching "
+            f"/mcp will be treated as authenticated. This must never be "
+            f"used for a network-exposed deployment."
+        )
+        return False
+    raise RuntimeError(
+        f"ENABLE_AUTH={raw!r} is unset or ambiguous (expected exactly "
+        f"'true' or 'false'). Refusing to start with authentication "
+        f"implicitly disabled — a forgotten env var must not silently "
+        f"expose every tool unauthenticated. Set ENABLE_AUTH=true, set it "
+        f"to exactly 'false', or set ALLOW_INSECURE_NO_AUTH=true to "
+        f"explicitly opt into running without auth (local testing only)."
+    )
+
+
+ENABLE_AUTH = _resolve_enable_auth(_ENABLE_AUTH_RAW, _ALLOW_INSECURE_NO_AUTH)
+
+if PER_USER_TOKEN_MODE and not ENABLE_AUTH:
+    raise RuntimeError(
+        "GWS_PER_USER_TOKEN=true requires ENABLE_AUTH=true — per-user "
+        "credential isolation depends on a validated caller identity; "
+        "running it without auth would let any unauthenticated request "
+        "inject an arbitrary Google token."
+    )
+
+# --- REQUIRED_SCOPES: refuse to silently disable the scope check ---
+#
+# Leaving REQUIRED_SCOPES unset keeps the documented default scopes.
+# Explicitly setting it to an empty string used to silently disable the
+# scope check (any validly-signed token would connect) — treat that as a
+# misconfiguration when auth is on, not a valid way to say "no scopes
+# required"; require REQUIRE_SCOPES=false as an explicit opt-out instead.
+_REQUIRED_SCOPES_RAW = os.getenv("REQUIRED_SCOPES")
+_REQUIRE_SCOPES_OPT_OUT = os.getenv("REQUIRE_SCOPES", "true").lower() == "false"
+
+
+def _resolve_required_scopes(
+    raw: Optional[str], enable_auth: bool, opt_out: bool
+) -> list:
+    if raw is None:
+        return ["gws:read", "gws:write"]
+    scopes = raw.split()
+    if not scopes and enable_auth and not opt_out:
+        raise RuntimeError(
+            "REQUIRED_SCOPES is set to an empty string, which would disable "
+            "the OAuth scope check entirely — any validly-signed token "
+            "would connect regardless of scope. Refusing to start. Set "
+            "REQUIRED_SCOPES to a non-empty space-separated scope list, or "
+            "set REQUIRE_SCOPES=false to explicitly opt out of scope "
+            "enforcement."
+        )
+    return scopes
+
+
+REQUIRED_SCOPES = _resolve_required_scopes(
+    _REQUIRED_SCOPES_RAW, ENABLE_AUTH, _REQUIRE_SCOPES_OPT_OUT
+)
+
+# --- Per-request user token extraction (GWS_PER_USER_TOKEN) ---
+#
+# Exactly one source is consulted, chosen by which env var is set:
+#   GWS_USER_TOKEN_CLAIM  — read the token out of this claim in the already-
+#                           validated JWT payload (e.g. a Google access token
+#                           embedded by a token-exchange IdP). Takes priority
+#                           if set.
+#   GWS_USER_TOKEN_HEADER — otherwise, read the token from this forwarded
+#                           HTTP header (default "X-GWS-User-Token"),
+#                           populated by the client with its own Google
+#                           token.
+# Both are only consulted when GWS_PER_USER_TOKEN=true (see server.py); the
+# extracted value is stashed into the USER_TOKEN ContextVar for execute_gws.
+GWS_USER_TOKEN_CLAIM = os.getenv("GWS_USER_TOKEN_CLAIM", "").strip()
+GWS_USER_TOKEN_HEADER = os.getenv("GWS_USER_TOKEN_HEADER", "X-GWS-User-Token").strip()
+_GWS_USER_TOKEN_HEADER_BYTES = GWS_USER_TOKEN_HEADER.lower().encode("latin-1")
+
+# --- Unauthenticated route allowlist ---
+#
+# /docs and /openapi.json are disabled by default (EXPOSE_API_DOCS=false):
+# an unauthenticated Swagger UI/schema on a network-exposed server is
+# unnecessary information-disclosure surface. Set EXPOSE_API_DOCS=true to
+# restore them (e.g. for local development convenience).
+EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "false").lower() == "true"
+_UNAUTHENTICATED_PATHS = {"/health"}
+if EXPOSE_API_DOCS:
+    _UNAUTHENTICATED_PATHS.update({"/docs", "/openapi.json"})
 
 jwks_client = None
 
@@ -53,7 +163,10 @@ app = FastAPI(
     title="GWS Remote MCP Server",
     description="An OAuth 2.1 protected MCP server wrapping the Google Workspace CLI",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs" if EXPOSE_API_DOCS else None,
+    openapi_url="/openapi.json" if EXPOSE_API_DOCS else None,
+    redoc_url=None,
 )
 
 class ASGIAuthMiddleware:
@@ -65,7 +178,7 @@ class ASGIAuthMiddleware:
             return await self.app(scope, receive, send)
 
         path = scope["path"]
-        if path in ["/health", "/docs", "/openapi.json"] or not ENABLE_AUTH:
+        if path in _UNAUTHENTICATED_PATHS or not ENABLE_AUTH:
             return await self.app(scope, receive, send)
 
         # Check auth
@@ -105,7 +218,24 @@ class ASGIAuthMiddleware:
             await self._send_401(send, f"Invalid token: {str(e)}", 'Bearer error="invalid_token"')
             return
 
+        # Per-request credential isolation: stash the caller's own Google
+        # token into a ContextVar (never os.environ / a module global —
+        # those would race across concurrent requests on this worker) so
+        # execute_gws can inject it into just that one gws child process.
+        if PER_USER_TOKEN_MODE:
+            USER_TOKEN.set(self._extract_user_token(headers, payload))
+
         return await self.app(scope, receive, send)
+
+    @staticmethod
+    def _extract_user_token(headers: Dict[bytes, bytes], payload: dict) -> Optional[str]:
+        if GWS_USER_TOKEN_CLAIM:
+            claim_value = payload.get(GWS_USER_TOKEN_CLAIM)
+            if isinstance(claim_value, str) and claim_value.strip():
+                return claim_value.strip()
+            return None
+        raw = headers.get(_GWS_USER_TOKEN_HEADER_BYTES, b"").decode("utf-8", errors="replace").strip()
+        return raw or None
 
     async def _send_401(self, send, detail, www_auth="Bearer"):
         import json
