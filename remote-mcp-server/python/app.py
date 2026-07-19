@@ -69,13 +69,41 @@ def _resolve_enable_auth(raw: Optional[str], allow_insecure: bool) -> bool:
 
 ENABLE_AUTH = _resolve_enable_auth(_ENABLE_AUTH_RAW, _ALLOW_INSECURE_NO_AUTH)
 
-if PER_USER_TOKEN_MODE and not ENABLE_AUTH:
-    raise RuntimeError(
-        "GWS_PER_USER_TOKEN=true requires ENABLE_AUTH=true — per-user "
-        "credential isolation depends on a validated caller identity; "
-        "running it without auth would let any unauthenticated request "
-        "inject an arbitrary Google token."
-    )
+
+def _check_per_user_token_preconditions(
+    per_user_token_mode: bool, enable_auth: bool, stateless_http: bool
+) -> None:
+    if not per_user_token_mode:
+        return
+    if not enable_auth:
+        raise RuntimeError(
+            "GWS_PER_USER_TOKEN=true requires ENABLE_AUTH=true — per-user "
+            "credential isolation depends on a validated caller identity; "
+            "running it without auth would let any unauthenticated request "
+            "inject an arbitrary Google token."
+        )
+    if not stateless_http:
+        # USER_TOKEN isolation relies on stateless_http=True: each request is
+        # handled by a fresh task copied from the request's own context, so
+        # the ContextVar set by the middleware is never visible to another
+        # caller. Without it, the mcp SDK's stateful path can run tool calls
+        # in a long-lived session task whose context was captured at
+        # session-creation time — a later caller reusing that session would
+        # silently execute with the session creator's token instead of
+        # failing closed. Keep this coupled to server.py's
+        # FastMCP(..., stateless_http=True); if that ever changes, this must
+        # be revisited before GWS_PER_USER_TOKEN can be used safely.
+        raise RuntimeError(
+            "GWS_PER_USER_TOKEN=true requires the FastMCP server to be "
+            "running with stateless_http=True (see server.py) — without "
+            "it, per-user token isolation is not guaranteed across "
+            "requests sharing a session."
+        )
+
+
+_check_per_user_token_preconditions(
+    PER_USER_TOKEN_MODE, ENABLE_AUTH, mcp.settings.stateless_http
+)
 
 # --- REQUIRED_SCOPES: refuse to silently disable the scope check ---
 #
@@ -127,6 +155,19 @@ GWS_USER_TOKEN_CLAIM = os.getenv("GWS_USER_TOKEN_CLAIM", "").strip()
 GWS_USER_TOKEN_HEADER = os.getenv("GWS_USER_TOKEN_HEADER", "X-GWS-User-Token").strip()
 _GWS_USER_TOKEN_HEADER_BYTES = GWS_USER_TOKEN_HEADER.lower().encode("latin-1")
 
+if not PER_USER_TOKEN_MODE and (GWS_USER_TOKEN_CLAIM or os.getenv("GWS_USER_TOKEN_HEADER")):
+    # Configuring a token source without GWS_PER_USER_TOKEN=true is a no-op —
+    # nothing ever reads GWS_USER_TOKEN_CLAIM/HEADER unless per-user mode is
+    # on — but it looks configured to an operator, so warn loudly rather
+    # than silently running in shared host-identity mode.
+    logger.warning(
+        "GWS_USER_TOKEN_CLAIM or GWS_USER_TOKEN_HEADER is set, but "
+        "GWS_PER_USER_TOKEN is not 'true' — this configuration has no "
+        "effect and every request will still execute as the host's shared "
+        "Google identity. Set GWS_PER_USER_TOKEN=true to enable per-user "
+        "credential isolation."
+    )
+
 # --- Unauthenticated route allowlist ---
 #
 # /docs and /openapi.json are disabled by default (EXPOSE_API_DOCS=false):
@@ -134,9 +175,20 @@ _GWS_USER_TOKEN_HEADER_BYTES = GWS_USER_TOKEN_HEADER.lower().encode("latin-1")
 # unnecessary information-disclosure surface. Set EXPOSE_API_DOCS=true to
 # restore them (e.g. for local development convenience).
 EXPOSE_API_DOCS = os.getenv("EXPOSE_API_DOCS", "false").lower() == "true"
-_UNAUTHENTICATED_PATHS = {"/health"}
-if EXPOSE_API_DOCS:
-    _UNAUTHENTICATED_PATHS.update({"/docs", "/openapi.json"})
+
+
+def _build_unauthenticated_paths(expose_docs: bool) -> set:
+    paths = {"/health"}
+    if expose_docs:
+        # /docs/oauth2-redirect is FastAPI's default
+        # swagger_ui_oauth2_redirect_url — Swagger UI's "Authorize" flow
+        # redirects the browser there with no Bearer header, so it needs
+        # the same bypass as /docs itself.
+        paths.update({"/docs", "/openapi.json", "/docs/oauth2-redirect"})
+    return paths
+
+
+_UNAUTHENTICATED_PATHS = _build_unauthenticated_paths(EXPOSE_API_DOCS)
 
 jwks_client = None
 
@@ -169,6 +221,19 @@ app = FastAPI(
     redoc_url=None,
 )
 
+def _extract_token_scopes(payload: dict) -> list:
+    """Reads the JWT's granted scopes, accepting either the standard
+    space-delimited "scope" string claim, or an Okta-style "scp" array claim
+    — Okta (an IdP this server's docs explicitly support) commonly issues
+    the latter instead of the former.
+    """
+    scope_claim = payload.get("scope")
+    if isinstance(scope_claim, str):
+        return scope_claim.split()
+    scp_claim = payload.get("scp")
+    return scp_claim if isinstance(scp_claim, list) else []
+
+
 class ASGIAuthMiddleware:
     def __init__(self, app):
         self.app = app
@@ -183,7 +248,11 @@ class ASGIAuthMiddleware:
 
         # Check auth
         headers = dict(scope.get("headers", []))
-        auth_header = headers.get(b"authorization", b"").decode("utf-8")
+        # errors="replace": HTTP field values may legally contain obs-text
+        # bytes (RFC 7230) that aren't valid UTF-8 — a strict decode would
+        # raise UnicodeDecodeError here and produce an unhandled 500 instead
+        # of the intended 401 for what is just an invalid/malformed token.
+        auth_header = headers.get(b"authorization", b"").decode("utf-8", errors="replace")
 
         if not auth_header.startswith("Bearer "):
             await self._send_401(send, "Missing or invalid Authorization header")
@@ -208,14 +277,18 @@ class ASGIAuthMiddleware:
                 options={"require": ["exp"]},
             )
 
-            # Check scopes (basic enterprise security practice)
-            token_scopes = payload.get("scope", "").split()
+            # Check scopes (basic enterprise security practice).
+            token_scopes = _extract_token_scopes(payload)
             if REQUIRED_SCOPES and not any(scope in token_scopes for scope in REQUIRED_SCOPES):
                 await self._send_401(send, "Insufficient scope", 'Bearer error="insufficient_scope"')
                 return
 
         except Exception as e:
-            await self._send_401(send, f"Invalid token: {str(e)}", 'Bearer error="invalid_token"')
+            # Log the detail server-side only — echoing str(e) to the client
+            # can leak internals (e.g. PyJWKClient connection errors embed
+            # the configured JWKS URI and underlying network error text).
+            logger.warning(f"Rejecting request with invalid token: {e}")
+            await self._send_401(send, "Invalid token", 'Bearer error="invalid_token"')
             return
 
         # Per-request credential isolation: stash the caller's own Google

@@ -35,7 +35,7 @@ It is designed for **Enterprise Deployments** and includes OAuth 2.1 authorizati
 | `REQUIRED_SCOPES` | Space-separated list: the JWT must contain at least one of these scopes. An explicit empty string with `ENABLE_AUTH=true` is treated as a misconfiguration (see `REQUIRE_SCOPES` below) rather than silently accepting any scope. | `gws:read gws:write` |
 | `REQUIRE_SCOPES` | Set to `false` to explicitly opt out of scope enforcement when you intend `REQUIRED_SCOPES=""` to mean "no scope required." Without this, an empty `REQUIRED_SCOPES` with auth enabled refuses to start. | `true` |
 | `GWS_ALLOWED_SERVICES` | Comma-separated list of `gws` service names clients may invoke. Set to `*` or omit to allow all. Note `auth`, `schema`, and `generate-skills` are CLI meta-commands and are never reachable through `execute_gws`, even under `*`; the `service:version` Discovery syntax is always rejected too (see §2). | *(unrestricted)* |
-| `GWS_PER_USER_TOKEN` | Set to `true` to enable per-request credential isolation for multi-tenant deployments — each call executes as the calling user's own Google identity instead of the host's. Requires `ENABLE_AUTH=true`. See §3.5. | `false` |
+| `GWS_PER_USER_TOKEN` | Must be exactly `true` or `false` (like `ENABLE_AUTH`, an ambiguous value refuses to start rather than silently disabling isolation). Set to `true` to enable per-request credential isolation for multi-tenant deployments — each call executes as the calling user's own Google identity instead of the host's. Requires `ENABLE_AUTH=true`. See §3.5. | `false` |
 | `GWS_USER_TOKEN_CLAIM` | When `GWS_PER_USER_TOKEN=true`, the name of a claim in the validated JWT payload to read the caller's Google token from. Takes priority over `GWS_USER_TOKEN_HEADER` if set. | *(unset — use header)* |
 | `GWS_USER_TOKEN_HEADER` | When `GWS_PER_USER_TOKEN=true` and `GWS_USER_TOKEN_CLAIM` is unset, the forwarded HTTP header the client uses to carry its Google token. | `X-GWS-User-Token` |
 | `EXPOSE_API_DOCS` | Set to `true` to mount and unauthenticate FastAPI's `/docs` (Swagger UI) and `/openapi.json`. Disabled by default — an unauthenticated schema/docs page is unnecessary information-disclosure surface on a network-exposed server. | `false` |
@@ -88,8 +88,9 @@ GWS_ALLOWED_SERVICES=*
 
 1. `auth`/`schema`/`generate-skills` are always rejected (see above), regardless of `GWS_ALLOWED_SERVICES`.
 2. A `service` containing `:` (e.g. `compute:v1`, `drive:v3`) is always rejected — this closes the Discovery `service:version` syntax as a way to reach APIs outside the allowlist's intent.
-3. The service name is normalized to its canonical Discovery API name via the same alias table `gws` itself uses (`crates/google-workspace/src/services.rs`) — so `reports` and `admin-reports` are treated as the same service, whichever spelling you put in `GWS_ALLOWED_SERVICES` or the client passes as `service`.
-4. The normalized name is checked against `GWS_ALLOWED_SERVICES`.
+3. A `command` or `args` token of `--api-version` (or `--api-version=...`) is always rejected. `gws` applies this flag while keeping the *same* canonical service name (`crates/google-workspace-cli/src/main.rs`'s `parse_service_and_version` only overrides the Discovery *version*, not the `api_name`), so without this check a caller could keep an allowed service name (e.g. `reports`) while silently reaching a completely different Google API that happens to share that name (e.g. `admin`'s `directory_v1` full user/group management API instead of `reports_v1`'s read-only audit logs).
+4. The service name is normalized to its canonical Discovery API name via the same alias table `gws` itself uses (`crates/google-workspace/src/services.rs`) — so `reports` and `admin-reports` are treated as the same service, whichever spelling you put in `GWS_ALLOWED_SERVICES` or the client passes as `service`.
+5. The normalized name is checked against `GWS_ALLOWED_SERVICES`.
 
 **Error response when a client requests a blocked service:**
 
@@ -105,12 +106,20 @@ Error: Service 'compute:v1' uses the 'api:version' Discovery syntax, which is
 not permitted through execute_gws. ...
 ```
 
+**Error response when a client uses `--api-version`:**
+
+```
+Error: '--api-version' is not permitted through execute_gws. It overrides the
+Discovery API version while keeping the same service name, which can silently
+repoint an allowed service at a different, unintended Google API.
+```
+
 ### 3. Restricting which clients can connect — marking OAuth scopes as allowed
 
-`REQUIRED_SCOPES` controls which *callers* may reach the `execute_gws` tool at all, independent of which services they're allowed to invoke once connected. This is enforced by `ASGIAuthMiddleware` in `python/app.py`, which reads the space-delimited `scope` claim out of the verified JWT and compares it against `REQUIRED_SCOPES`:
+`REQUIRED_SCOPES` controls which *callers* may reach the `execute_gws` tool at all, independent of which services they're allowed to invoke once connected. This is enforced by `ASGIAuthMiddleware` in `python/app.py`, which reads the granted scopes out of the verified JWT and compares them against `REQUIRED_SCOPES`. Two claim formats are accepted — the standard space-delimited `scope` string, or an Okta-style `scp` array (Okta commonly issues the latter instead):
 
 ```python
-token_scopes = payload.get("scope", "").split()
+token_scopes = _extract_token_scopes(payload)  # "scope" string, or "scp" array
 if REQUIRED_SCOPES and not any(scope in token_scopes for scope in REQUIRED_SCOPES):
     ...  # 401 insufficient_scope
 ```
@@ -161,7 +170,9 @@ With this on, `ASGIAuthMiddleware` extracts a Google access token for the *calli
 
 That token is injected into the `gws` child process's environment (`GOOGLE_WORKSPACE_CLI_TOKEN`) for that one call only — built as a request-local dict, never written to `os.environ`, and never shared across concurrent requests (it's carried through a `contextvars.ContextVar`, not a module global, specifically because a plain global would leak across concurrent callers under `stateless_http`). If no token is available for a request, `execute_gws` returns an error rather than silently falling back to the host's credentials — the Rust CLI itself would otherwise fall through `GOOGLE_WORKSPACE_CLI_TOKEN=""` to `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`/ADC, which is exactly the confused-deputy behavior this mode exists to prevent.
 
-`GWS_PER_USER_TOKEN=true` requires `ENABLE_AUTH=true` — the server refuses to start otherwise, since per-user isolation is meaningless without a validated caller identity to isolate by.
+`GWS_PER_USER_TOKEN` must be exactly `true`/`false`/unset — like `ENABLE_AUTH`, an ambiguous value (e.g. `1`, `yes`) refuses to start rather than being silently treated as `false`, since that direction of ambiguity would quietly fall back to shared host-identity mode.
+
+`GWS_PER_USER_TOKEN=true` requires `ENABLE_AUTH=true` — the server refuses to start otherwise, since per-user isolation is meaningless without a validated caller identity to isolate by. It also requires `server.py`'s `FastMCP(..., stateless_http=True)` to remain in effect: the isolation guarantee relies on each request running in a fresh task copied from that request's own context, so the `USER_TOKEN` ContextVar is never visible to another caller. The server checks this at startup too (`mcp.settings.stateless_http`) and refuses to start if it's ever turned off while per-user mode is on.
 
 ### 4. Running the Server
 
@@ -195,12 +206,13 @@ curl -I http://localhost:8000/health
 
 The response body is `{"status": "ok", "service": "gws-mcp-server"}`.
 
-`/docs` (Swagger UI) and `/openapi.json` are **not** mounted by default — an unauthenticated schema/docs page is unnecessary information-disclosure surface on a network-exposed server. Set `EXPOSE_API_DOCS=true` to restore them (e.g. for local development convenience); when enabled, they remain unauthenticated (see `ASGIAuthMiddleware` in `app.py`) and only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them.
+`/docs` (Swagger UI) and `/openapi.json` are **not** mounted by default — an unauthenticated schema/docs page is unnecessary information-disclosure surface on a network-exposed server. Set `EXPOSE_API_DOCS=true` to restore them (e.g. for local development convenience); when enabled, they (and `/docs/oauth2-redirect`, needed for Swagger UI's "Authorize" flow) remain unauthenticated (see `ASGIAuthMiddleware` in `app.py`) and only expose the `/health` route's schema — the `/mcp` tool surface is mounted separately and is not reachable through them.
 
 ### 6. Logging and Observability
 
 - Uses the standard `logging` module. Configure `logging.basicConfig` in `app.py` to emit JSON logs if your log aggregator (Datadog, Splunk, ELK) prefers structured logs. Note that `app.py` calls `logging.basicConfig()` **before** importing `server.py` — importing first would let `server.py`'s own logging calls implicitly configure the root logger at the default `WARNING` level, silently swallowing the `INFO` logs this server relies on for auditing.
-- Each `gws` CLI invocation logs only the `service` and `command` (e.g. `service='gmail' command='messages send'`) — never `--params` or `args`, which can carry request PII (message bodies, search queries, recipient addresses). The Google credential itself is passed via the child process's environment, not the command line, so it never appears in logs either way.
+- Each `gws` CLI invocation logs only the `service` and the first two whitespace-separated tokens of `command` (e.g. `service='gmail' command='messages send'`) — never the full `command` string, `--params`, or `args`, which can carry request PII (message bodies, search queries, recipient addresses, resource IDs). The two-token cap matters because every Discovery-driven `gws` method takes its parameters via `--params`/`--json` rather than positionally, so a legitimate `command` never needs more than a resource+verb pair — anything a caller appends beyond that is either noise or exactly the kind of identifier this redaction exists to keep out of the logs. The Google credential itself is passed via the child process's environment, not the command line, so it never appears in logs either way.
+- Rejected/invalid-token responses never echo the underlying exception text to the client (e.g. a JWKS fetch failure's connection error, which can embed the configured JWKS URI) — the detail is logged server-side only, and the client gets a generic `"Invalid token"` message.
 
 ### 7. Client Connection
 
@@ -222,4 +234,4 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Covers the service allowlist (`:` rejection, alias normalization, always-blocked meta-commands), per-request token isolation (including a concurrency test asserting two simultaneous calls never observe each other's token), the `ENABLE_AUTH`/`REQUIRED_SCOPES` fail-closed startup guards, and the logging redaction.
+Covers the service allowlist (`:` rejection, `--api-version` rejection, alias normalization, always-blocked meta-commands), per-request token isolation (including a concurrency test asserting two simultaneous calls never observe each other's token, and the `GWS_PER_USER_TOKEN`/`ENABLE_AUTH`/`stateless_http` startup cross-checks), the `ENABLE_AUTH`/`REQUIRED_SCOPES` fail-closed startup guards, the logging redaction, and the Okta `scp`-claim and exception-text-redaction fixes. This suite runs in CI (`.github/workflows/ci.yml`) on any change under `remote-mcp-server/python/`.

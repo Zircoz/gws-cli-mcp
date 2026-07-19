@@ -161,7 +161,8 @@ cd remote-mcp-server/python
 pip install -r requirements.txt
 
 # Minimal launch (auth disabled, for local testing):
-uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
+# ENABLE_AUTH must be set explicitly — the server refuses to start otherwise.
+ENABLE_AUTH=false uvicorn app:app_with_auth --host 0.0.0.0 --port 8000
 
 # Production launch (gunicorn is not in requirements.txt — install separately):
 pip install gunicorn
@@ -196,6 +197,13 @@ COPY remote-mcp-server/python/ .
 
 # Credentials are injected at runtime — never bake them into the image
 ENV GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/etc/gws/credentials.json
+
+# ENABLE_AUTH is not a secret, so it's safe to default it here — the image
+# ships secure-by-default. It (and OAUTH_ISSUER, JWKS_URI, OAUTH_AUDIENCE,
+# GWS_ALLOWED_SERVICES, etc.) can still be overridden at `docker run` time
+# with -e, but the server now refuses to start if ENABLE_AUTH is left unset
+# entirely, so every image built from this recipe must carry some value.
+ENV ENABLE_AUTH=true
 
 EXPOSE 8000
 CMD ["gunicorn", "app:app_with_auth", "-k", "uvicorn.workers.UvicornWorker", \

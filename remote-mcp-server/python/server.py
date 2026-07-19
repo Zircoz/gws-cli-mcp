@@ -116,7 +116,29 @@ else:
 # app.py, after JWT validation — is injected into just that one `gws` child
 # process's environment, so each call executes as the calling user instead
 # of the host.
-PER_USER_TOKEN_MODE: bool = os.getenv("GWS_PER_USER_TOKEN", "false").lower() == "true"
+#
+def _resolve_per_user_token_mode(raw: Optional[str]) -> bool:
+    """Parses GWS_PER_USER_TOKEN strictly (must be exactly "true"/"false"/
+    unset), not with a lenient `.lower() == "true"` comparison: unlike the
+    other boolean env vars here, an ambiguous value for this one fails
+    toward *less* security (silently falling back to shared host-identity
+    mode) rather than more, so it gets the same fail-closed treatment as
+    ENABLE_AUTH in app.py.
+    """
+    if raw is None or raw.strip() == "":
+        return False
+    normalized = raw.strip().lower()
+    if normalized not in ("true", "false"):
+        raise RuntimeError(
+            f"GWS_PER_USER_TOKEN={raw!r} is not a recognized value. Set it "
+            f"to exactly 'true' or 'false' — ambiguous values (e.g. '1', "
+            f"'yes') are rejected rather than silently falling back to "
+            f"shared host-identity credentials."
+        )
+    return normalized == "true"
+
+
+PER_USER_TOKEN_MODE: bool = _resolve_per_user_token_mode(os.getenv("GWS_PER_USER_TOKEN"))
 
 # Set per-request by app.py's ASGIAuthMiddleware. A contextvars.ContextVar is
 # required here rather than a module-level global/dict: the stateless_http
@@ -148,8 +170,14 @@ async def execute_gws(
     # 1. Meta-commands are blocked unconditionally, regardless of allowlist.
     # 2. The "service:version" escape hatch (reaches arbitrary Discovery
     #    APIs) is closed outright.
-    # 3. Aliases are normalized to their canonical name.
-    # 4. Only then is the (canonicalized) allowlist consulted.
+    # 3. The "--api-version" flag escape hatch is closed outright — gws
+    #    applies it while keeping the service's canonical api_name, so it
+    #    can silently repoint an allowed service (e.g. "reports") at a
+    #    completely different Google API sharing that api_name (e.g.
+    #    "admin"'s "directory_v1" instead of "reports_v1") without ever
+    #    touching the `service` argument the allowlist checks.
+    # 4. Aliases are normalized to their canonical name.
+    # 5. Only then is the (canonicalized) allowlist consulted.
     if service in ALWAYS_BLOCKED_SERVICES:
         return (
             f"Error: Service '{service}' is a CLI meta-command and is never "
@@ -165,6 +193,15 @@ async def execute_gws(
             f"GWS_ALLOWED_SERVICES. Use a plain service name instead (e.g. "
             f"'drive', not 'drive:v3')."
         )
+
+    for token in [*command.split(), *(args or [])]:
+        if token == "--api-version" or token.startswith("--api-version="):
+            return (
+                "Error: '--api-version' is not permitted through "
+                "execute_gws. It overrides the Discovery API version while "
+                "keeping the same service name, which can silently repoint "
+                "an allowed service at a different, unintended Google API."
+            )
 
     canonical_service = _normalize_service(service)
 
@@ -206,9 +243,16 @@ async def execute_gws(
         child_env = base_env
 
     try:
-        # Log only the service and command verb — never --params or args,
-        # which can carry request PII (message bodies, search queries, etc).
-        logger.info(f"Executing gws command: service={service!r} command={command!r}")
+        # Log only the service and the resource+verb pair — never the full
+        # command, --params, or args, which can carry request PII (message
+        # bodies, search queries, resource IDs). gws's own CLI surface never
+        # needs more than two tokens here: every Discovery-driven method
+        # takes its parameters via --params/--json (never positionally), and
+        # the "+verb" helpers take a single token. Anything a caller appends
+        # beyond that is either noise or exactly the kind of embedded
+        # identifier this redaction exists to keep out of the logs.
+        logged_command = " ".join(command.split()[:2])
+        logger.info(f"Executing gws command: service={service!r} command={logged_command!r}")
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,

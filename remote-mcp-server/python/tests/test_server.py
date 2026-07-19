@@ -78,6 +78,44 @@ async def test_schema_and_generate_skills_always_blocked(monkeypatch):
         assert "meta-command" in result
 
 
+async def test_api_version_flag_rejected_in_args(monkeypatch):
+    """--api-version overrides only the Discovery *version* while keeping
+    the service's canonical api_name (crates/google-workspace-cli/src/
+    main.rs's parse_service_and_version), so it can silently repoint an
+    allowed service (e.g. "reports") at a completely different Google API
+    that happens to share the same api_name (e.g. "admin"'s "directory_v1"
+    instead of "reports_v1") without ever touching the `service` argument
+    the allowlist checks. Must be rejected regardless of allowlist state."""
+    monkeypatch.setattr(server, "ALLOWED_SERVICES", {"reports"})
+    monkeypatch.setattr(server, "ALLOWED_SERVICES_CANONICAL", {"admin"})
+
+    async def fail_spawn(*a, **k):
+        pytest.fail("must not spawn a subprocess when --api-version is present")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+
+    result = await server.execute_gws(
+        service="reports",
+        command="users list",
+        args=["--api-version", "directory_v1"],
+    )
+    assert "--api-version" in result
+    assert "not permitted on this server" not in result  # rejected by the api-version check, not the allowlist
+
+
+async def test_api_version_flag_rejected_equals_form_and_in_command(monkeypatch):
+    monkeypatch.setattr(server, "ALLOWED_SERVICES", None)
+    monkeypatch.setattr(server, "ALLOWED_SERVICES_CANONICAL", None)
+
+    async def fail_spawn(*a, **k):
+        pytest.fail("must not spawn a subprocess when --api-version is present")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_spawn)
+
+    result = await server.execute_gws(service="drive", command="files list --api-version=v2")
+    assert "--api-version" in result
+
+
 async def test_allowed_service_reaches_subprocess(monkeypatch):
     monkeypatch.setattr(server, "ALLOWED_SERVICES", {"drive"})
     monkeypatch.setattr(server, "ALLOWED_SERVICES_CANONICAL", {"drive"})
@@ -196,3 +234,50 @@ async def test_logging_excludes_params_and_args(monkeypatch, caplog):
     assert "supersecretpayload" not in log_text
     assert "gmail" in log_text
     assert "messages send" in log_text
+
+
+async def test_logging_truncates_command_beyond_resource_and_verb(monkeypatch, caplog):
+    """gws's own CLI surface never needs more than two tokens here — every
+    Discovery-driven method takes its parameters via --params/--json, never
+    positionally — so anything a caller appends beyond that (e.g. a resource
+    ID mistakenly placed in `command` instead of `params`) must not reach
+    the logs."""
+    monkeypatch.setattr(server, "PER_USER_TOKEN_MODE", False)
+
+    async def fake_spawn(*cmd, stdout, stderr, env):
+        return FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+
+    with caplog.at_level(logging.INFO):
+        await server.execute_gws(
+            service="drive", command="files get 1AbC_a_customers_secret_file_id"
+        )
+
+    log_text = "\n".join(record.message for record in caplog.records)
+    assert "1AbC_a_customers_secret_file_id" not in log_text
+    assert "files get" in log_text
+
+
+# --- GWS_PER_USER_TOKEN strict parsing ---
+
+
+def test_resolve_per_user_token_mode_unset_defaults_false():
+    assert server._resolve_per_user_token_mode(None) is False
+    assert server._resolve_per_user_token_mode("") is False
+
+
+def test_resolve_per_user_token_mode_explicit_values():
+    assert server._resolve_per_user_token_mode("true") is True
+    assert server._resolve_per_user_token_mode("True") is True
+    assert server._resolve_per_user_token_mode("false") is False
+    assert server._resolve_per_user_token_mode("FALSE") is False
+
+
+@pytest.mark.parametrize("value", ["1", "0", "yes", "no", "enabled"])
+def test_resolve_per_user_token_mode_ambiguous_values_raise(value):
+    """Unlike the other new boolean env vars, an ambiguous value here must
+    fail loudly rather than silently disabling per-user credential
+    isolation (the one direction that's actually unsafe)."""
+    with pytest.raises(RuntimeError, match="not a recognized value"):
+        server._resolve_per_user_token_mode(value)
